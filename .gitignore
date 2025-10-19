@@ -1,0 +1,10 @@
+paper/
+paper_*/
+
+papers/
+papers_*/
+__pycache__/
+.DS_Store
+
+CLAUDE.md
+pubmed_mcp.log
