@@ -3,22 +3,17 @@ FastMCP server for PubMed search and paper download
 """
 
 import os
-import argparse
 from typing import List, Dict, Any, Optional
 from fastmcp import FastMCP
 from utils.pubmed_search import search_lr, search_general
 from utils.paper_download import download_paper_from_doi
 
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="PubMed Download MCP Server")
-parser.add_argument("--email", type=str, help="Email address for NCBI Entrez API (required)")
-parser.add_argument("--jina-api-key", type=str, help="Jina AI API key for paper downloads (optional)")
-
-# Get configuration from command-line arguments or environment variables
-args, _ = parser.parse_known_args()
-entrez_email = args.email or os.getenv("PUBMED_EMAIL", "")
-jina_api_key = args.jina_api_key or os.getenv("JINA_API_KEY", None)
+# Get configuration from environment variables
+# Support both simple names (email, JINA_API_KEY) and legacy names (PUBMED_EMAIL, JINA_API_KEY)
+# Note: Environment variables cannot have hyphens, so jina-api-key in JSON becomes JINA_API_KEY
+entrez_email = os.getenv("email") or os.getenv("PUBMED_EMAIL", "")
+jina_api_key = os.getenv("JINA_API_KEY", None)
 
 # Create FastMCP server
 mcp = FastMCP("PubMed Download")
