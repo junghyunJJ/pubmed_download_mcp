@@ -10,9 +10,7 @@ from utils.paper_download import download_paper_from_doi
 
 
 # Get configuration from environment variables
-# Support both simple names (email, JINA_API_KEY) and legacy names (PUBMED_EMAIL, JINA_API_KEY)
-# Note: Environment variables cannot have hyphens, so jina-api-key in JSON becomes JINA_API_KEY
-entrez_email = os.getenv("email") or os.getenv("PUBMED_EMAIL", "")
+entrez_email = os.getenv("PUBMED_EMAIL", "")
 jina_api_key = os.getenv("JINA_API_KEY", None)
 
 # Create FastMCP server
