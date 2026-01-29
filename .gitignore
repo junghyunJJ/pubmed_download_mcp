@@ -10,4 +10,6 @@ __pycache__/
 CLAUDE.md
 pubmed_mcp.log
 
-METHOD*
+papers/
+METHOD*                                                                                           
+*method*.md  
