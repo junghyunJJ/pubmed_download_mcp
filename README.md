@@ -13,20 +13,25 @@ A Model Context Protocol (MCP) server for searching PubMed and downloading scien
 - **Async Operations**: Non-blocking operations for better performance
 - **NCBI Compliant**: Rate limiting and proper headers to prevent blocking
 
-## Version 4.0 Updates
+## Version 4.1 Updates
 
-### New Features
+### New Features (v4.1)
+- **Improved Fallback Chain**: PMC failure now properly falls back to DOI
+- **Modular Code**: Helper functions for cleaner, maintainable code
+- **Better Error Handling**: Detailed failure messages showing all attempted methods
+
+### Previous Features (v4.0)
 - **NCBI efetch for PMC**: Direct download via official NCBI API (no DDoS blocking)
 - **JATS XML Parsing**: Full-text extraction from PMC's XML format
 - **References Excluded**: Cleaner output for RAG (removes reference noise)
 - **PubMed Abstract Fallback**: Papers without PMC or DOI return abstracts with metadata
 
-### Download Strategy (v4.0)
+### Download Strategy (v4.1)
 ```
 1. Check Cache (full text or abstract)
-2. If PMC available: Try NCBI efetch ✨ NEW (official API, no blocking)
-3. Fallback: DOI via Jina Reader
-4. Fallback: PMC via Jina Reader (legacy)
+2. If PMC available: Try NCBI efetch (official API, no blocking)
+3. If efetch fails: Try PMC via Jina Reader
+4. If PMC fails: Try DOI via Jina Reader  ← NEW in v4.1
 5. Final Fallback: Fetch abstract from PubMed
 ```
 
@@ -145,15 +150,15 @@ download_paper(
 
 **Returns**: Dictionary with success status, file path, source, and message
 
-### Download Behavior (v4.0)
+### Download Behavior (v4.1)
 
 | Scenario | Source | Result |
 |----------|--------|--------|
-| PMC available | `PMC_efetch` (NCBI API) | Full-text paper (JATS XML → plain text) |
-| PMC efetch fails | `PMC` (via Jina Reader) | Full-text paper (legacy fallback) |
-| DOI available | `DOI` (via Jina Reader) | Full-text paper |
-| Neither available | `PubMed_Abstract` | Abstract + metadata |
 | Already cached | `Cache` | Cached file (no download) |
+| PMC available + efetch works | `PMC_efetch` | Full-text (JATS XML → plain text) |
+| PMC efetch fails + Jina works | `PMC` | Full-text (via Jina Reader) |
+| PMC fails + DOI available | `DOI` | Full-text (via Jina Reader) ← **v4.1** |
+| No PMC/DOI available | `PubMed_Abstract` | Abstract + metadata |
 
 ### Output Files
 
@@ -272,8 +277,9 @@ The server implements NCBI-compliant rate limiting:
 - **Solution**: Server automatically implements delays; wait and retry
 
 **Issue**: Jina Reader blocked by PMC (DDoS detection)
-- **Solution**: v4.0 uses NCBI efetch as primary method (no blocking)
+- **Solution**: v4.0+ uses NCBI efetch as primary method (no blocking)
 - **Note**: efetch only works for PMC Open Access papers
+- **v4.1**: If PMC fails completely, now falls back to DOI automatically
 
 ### Debug Mode
 
@@ -353,7 +359,14 @@ MIT License - See LICENSE file for details
 
 ## Changelog
 
-### v4.0 (Current)
+### v4.1 (Current)
+- ✨ **Improved fallback chain**: PMC failure now properly falls back to DOI
+- ✨ Added `_try_jina_download()` helper for modular Jina API calls
+- ✨ Added `_determine_output_path()` and `_save_content()` helpers
+- ✨ Better error messages showing all attempted download methods
+- 🐛 Fixed bug where PMC Jina failure skipped DOI fallback
+
+### v4.0
 - ✨ Added NCBI efetch for PMC downloads (official API, no DDoS blocking)
 - ✨ Added JATS XML to plain text parser (`parse_jats_xml_to_text`)
 - ✨ References excluded from output for RAG efficiency

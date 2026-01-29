@@ -464,6 +464,98 @@ async def download_with_retry(
         raise requests.exceptions.RequestException("Download failed after all retries")
 
 
+async def _try_jina_download(
+    url: str,
+    jina_api_key: Optional[str],
+    entrez_email: Optional[str]
+) -> Optional[str]:
+    """
+    Helper function to download content via Jina Reader API.
+
+    Args:
+        url: Target URL to fetch
+        jina_api_key: Optional Jina API key
+        entrez_email: Email for User-Agent
+
+    Returns:
+        Content string if successful, None if failed
+    """
+    jina_url = f"https://r.jina.ai/{url}"
+    user_agent = f"PubMedDownloadMCP/1.0 ({entrez_email or 'unknown@example.com'})"
+
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
+
+    if jina_api_key:
+        headers["Authorization"] = f"Bearer {jina_api_key}"
+        headers["X-Respond-With"] = "markdown"
+        headers["X-With-Generated-Alt"] = "true"
+        headers["X-Remove-Selector"] = "header,footer,nav,.cookie-banner,.advertisement"
+
+    try:
+        result = await download_with_retry(jina_url, headers, max_retries=5)
+
+        # Check for errors or authentication issues
+        if result.status_code in [401, 403, 405]:
+            headers_basic = {"User-Agent": user_agent, "Accept": "*/*"}
+            result = await download_with_retry(jina_url, headers_basic, max_retries=3)
+
+        # If still getting errors, try search mode
+        if result.status_code >= 400:
+            try:
+                content = result.text.lower()
+                if any(error in content for error in ["cookies disabled", "cookie", "access denied", "403 forbidden", "paywall"]):
+                    jina_url_search = f"https://s.jina.ai/{url}"
+                    headers_simple = {"User-Agent": user_agent}
+                    result = await download_with_retry(jina_url_search, headers_simple, max_retries=3)
+            except:
+                pass
+
+        result.raise_for_status()
+        return result.text
+
+    except requests.exceptions.RequestException as e:
+        print(f"Jina download failed for {url}: {str(e)}")
+        return None
+
+
+def _determine_output_path(
+    output_path: Optional[str],
+    doi: Optional[str],
+    pmid: Optional[str],
+    pmcid: Optional[str] = None,
+    is_abstract: bool = False
+) -> str:
+    """Helper function to determine the output file path."""
+    if output_path:
+        return output_path
+
+    if doi:
+        sanitized_doi = doi.replace("/", "_").replace(":", "_")
+        return f"./papers/{sanitized_doi}.txt"
+    elif pmid:
+        sanitized_pmid = pmid.replace("/", "_").replace(":", "_")
+        suffix = "_abstract" if is_abstract else ""
+        return f"./papers/pmid_{sanitized_pmid}{suffix}.txt"
+    elif pmcid:
+        sanitized_pmcid = pmcid.replace("/", "_").replace(":", "_")
+        return f"./papers/{sanitized_pmcid}.txt"
+    else:
+        return "./papers/unknown_paper.txt"
+
+
+def _save_content(content: str, file_path: str) -> None:
+    """Helper function to save content to file."""
+    dir_path = os.path.dirname(file_path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 async def download_paper_from_doi(
     doi: Optional[str] = None,
     output_path: Optional[str] = None,
@@ -482,11 +574,11 @@ async def download_paper_from_doi(
     Implements improved rate limiting, retry logic, and NCBI-compliant headers
     to prevent DDoS detection and blocking.
 
-    Download strategy:
+    Download strategy (v4.1 - improved fallback):
     1. Check cache first
-    2. If PMC available: Try NCBI efetch (official API, no blocking)
-    3. Fallback to DOI via Jina Reader API
-    4. Final fallback to PubMed abstract
+    2. If PMC available: Try NCBI efetch → If fails, try PMC via Jina
+    3. If PMC fails or unavailable: Try DOI via Jina Reader API
+    4. Final fallback: PubMed abstract only
 
     Args:
         doi: Paper DOI (optional if pmid provided)
@@ -499,7 +591,7 @@ async def download_paper_from_doi(
         force_download: If True, re-downloads even if file exists (default: False)
 
     Returns:
-        Dictionary with success status, file path, message, and source (PMC, DOI, or Cache)
+        Dictionary with success status, file path, message, and source (PMC_efetch/PMC/DOI/PubMed_Abstract/Cache)
     """
     # Validation: At least one identifier must be provided
     if not doi and not pmid:
@@ -511,9 +603,8 @@ async def download_paper_from_doi(
         }
 
     try:
-        # Check cache first unless force_download is True
+        # ===== STEP 1: Check cache =====
         if not force_download:
-            # Try checking with both DOI and PMID
             if doi:
                 cached_path = check_cached_paper(doi, output_path)
                 if cached_path:
@@ -524,7 +615,6 @@ async def download_paper_from_doi(
                         "message": f"Paper already downloaded at {cached_path}"
                     }
             if pmid and not doi:
-                # Also check PMID-based filename (both full text and abstract)
                 sanitized_pmid = pmid.replace("/", "_").replace(":", "_")
                 pmid_path = f"./papers/pmid_{sanitized_pmid}.txt"
                 pmid_abstract_path = f"./papers/pmid_{sanitized_pmid}_abstract.txt"
@@ -544,13 +634,11 @@ async def download_paper_from_doi(
                         "message": f"Abstract already downloaded at {pmid_abstract_path}"
                     }
 
-        actual_url = None
-        source = "DOI"
         pmcid = None
 
-        # Try PMC first if requested
+        # ===== STEP 2: Try PMC if preferred =====
         if prefer_pmc and pmid and entrez_email:
-            # NCBI rate limiting: 2-4 seconds with random jitter
+            # NCBI rate limiting
             delay = random.uniform(2.0, 4.0)
             print(f"Waiting {delay:.1f}s for NCBI rate limiting...")
             await asyncio.sleep(delay)
@@ -559,223 +647,125 @@ async def download_paper_from_doi(
             if pmcid:
                 print(f"Found PMC version: {pmcid}, trying NCBI efetch...")
 
-                # Try NCBI efetch first (official API, no DDoS blocking)
+                # 2a. Try NCBI efetch first (official API, no DDoS blocking)
                 efetch_result = await fetch_pmc_fulltext(pmcid, entrez_email, ncbi_api_key)
 
                 if efetch_result["success"]:
-                    # Determine output path
-                    final_output_path = output_path
-                    if final_output_path is None:
-                        if doi:
-                            sanitized_doi = doi.replace("/", "_").replace(":", "_")
-                            final_output_path = f"./papers/{sanitized_doi}.txt"
-                        elif pmid:
-                            sanitized_pmid = pmid.replace("/", "_").replace(":", "_")
-                            final_output_path = f"./papers/pmid_{sanitized_pmid}.txt"
-                        else:
-                            sanitized_pmcid = pmcid.replace("/", "_").replace(":", "_")
-                            final_output_path = f"./papers/{sanitized_pmcid}.txt"
-
-                    # Create directory if needed
-                    dir_path = os.path.dirname(final_output_path)
-                    if dir_path:
-                        os.makedirs(dir_path, exist_ok=True)
-
-                    # Save to file
-                    with open(final_output_path, "w", encoding="utf-8") as f:
-                        f.write(efetch_result["content"])
-
+                    final_path = _determine_output_path(output_path, doi, pmid, pmcid)
+                    _save_content(efetch_result["content"], final_path)
                     return {
                         "success": True,
-                        "file_path": final_output_path,
+                        "file_path": final_path,
                         "source": "PMC_efetch",
-                        "message": f"Successfully downloaded paper from PMC via NCBI efetch to {final_output_path}"
+                        "message": f"Successfully downloaded paper from PMC via NCBI efetch to {final_path}"
                     }
-                else:
-                    # efetch failed, fall back to Jina Reader
-                    print(f"NCBI efetch failed: {efetch_result['message']}, falling back to Jina Reader...")
-                    actual_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
-                    source = "PMC"
 
-        # Use DOI by default or as fallback
-        if not actual_url and doi:
-            doi_url = f"https://doi.org/{doi}"
-            # Add delay before DOI request too
+                # 2b. efetch failed, try PMC via Jina Reader
+                print(f"NCBI efetch failed: {efetch_result['message']}, trying PMC via Jina...")
+                pmc_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+                pmc_content = await _try_jina_download(pmc_url, jina_api_key, entrez_email)
+
+                if pmc_content:
+                    final_path = _determine_output_path(output_path, doi, pmid, pmcid)
+                    _save_content(pmc_content, final_path)
+                    return {
+                        "success": True,
+                        "file_path": final_path,
+                        "source": "PMC",
+                        "message": f"Successfully downloaded paper from PMC via Jina to {final_path}"
+                    }
+
+                print(f"PMC Jina also failed, falling back to DOI...")
+
+        # ===== STEP 3: Try DOI =====
+        if doi:
+            print(f"Trying DOI: {doi}")
             await asyncio.sleep(random.uniform(1.0, 2.0))
-            response = await asyncio.to_thread(requests.get, doi_url, allow_redirects=True, timeout=30)
-            actual_url = response.url
-            print(f"Using DOI URL: {actual_url}")
 
-        # If still no URL and only PMID provided, fetch abstract as fallback
-        if not actual_url:
-            if not pmid:
-                return {
-                    "success": False,
-                    "file_path": "",
-                    "source": "Unknown",
-                    "message": "No DOI or PMID provided"
-                }
+            try:
+                response = await asyncio.to_thread(
+                    requests.get, f"https://doi.org/{doi}",
+                    allow_redirects=True, timeout=30
+                )
+                actual_url = response.url
+                print(f"Resolved DOI URL: {actual_url}")
 
-            if not entrez_email:
-                return {
-                    "success": False,
-                    "file_path": "",
-                    "source": "PubMed_Abstract",
-                    "message": "Email required for PubMed abstract fallback"
-                }
+                doi_content = await _try_jina_download(actual_url, jina_api_key, entrez_email)
 
-            print(f"No PMC or DOI available for PMID {pmid}, fetching abstract from PubMed...")
+                if doi_content:
+                    final_path = _determine_output_path(output_path, doi, pmid)
+                    _save_content(doi_content, final_path)
+                    return {
+                        "success": True,
+                        "file_path": final_path,
+                        "source": "DOI",
+                        "message": f"Successfully downloaded paper from DOI to {final_path}"
+                    }
 
-            # Fetch abstract from PubMed
+                print(f"DOI download failed, falling back to abstract...")
+
+            except requests.exceptions.RequestException as e:
+                print(f"DOI resolution failed: {str(e)}, falling back to abstract...")
+
+        # ===== STEP 4: Fallback to PubMed abstract =====
+        if pmid and entrez_email:
+            print(f"Fetching abstract for PMID {pmid}...")
             abstract_result = await fetch_pubmed_abstract(pmid, entrez_email)
 
-            if not abstract_result["success"]:
+            if abstract_result["success"]:
+                final_path = _determine_output_path(output_path, doi, pmid, is_abstract=True)
+                _save_content(abstract_result["content"], final_path)
                 return {
-                    "success": False,
-                    "file_path": "",
+                    "success": True,
+                    "file_path": final_path,
                     "source": "PubMed_Abstract",
-                    "message": abstract_result["message"]
+                    "message": f"Full text unavailable. Saved abstract to {final_path}"
                 }
 
-            # Determine output path for abstract
-            final_output_path = output_path
-            if final_output_path is None:
-                sanitized_pmid = pmid.replace("/", "_").replace(":", "_")
-                final_output_path = f"./papers/pmid_{sanitized_pmid}_abstract.txt"
-
-            # Create directory if needed
-            dir_path = os.path.dirname(final_output_path)
-            if dir_path:
-                os.makedirs(dir_path, exist_ok=True)
-
-            # Save abstract to file
-            with open(final_output_path, "w", encoding="utf-8") as f:
-                f.write(abstract_result["content"])
-
-            return {
-                "success": True,
-                "file_path": final_output_path,
-                "source": "PubMed_Abstract",
-                "message": f"Successfully saved abstract to {final_output_path}. Note: Full text not available for PMID {pmid}"
-            }
-
-        # Call Jina Reader with NCBI-compliant headers
-        jina_url = f"https://r.jina.ai/{actual_url}"
-
-        # NCBI-compliant User-Agent with email (recommended by NCBI)
-        user_agent = f"PubMedDownloadMCP/1.0 ({entrez_email or 'unknown@example.com'})"
-
-        headers = {
-            "User-Agent": user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5"
-        }
-
-        # Add Jina-specific headers if API key is provided
-        if jina_api_key:
-            headers["Authorization"] = f"Bearer {jina_api_key}"
-            headers["X-Respond-With"] = "markdown"
-            headers["X-With-Generated-Alt"] = "true"
-            headers["X-Remove-Selector"] = "header,footer,nav,.cookie-banner,.advertisement"
-
-        # Download with retry logic
-        try:
-            result = await download_with_retry(jina_url, headers, max_retries=5)
-        except requests.exceptions.RequestException as e:
-            # Check if it's a SecurityCompromiseError from Jina
-            error_msg = str(e)
-            if "SecurityCompromiseError" in error_msg or "DDoS" in error_msg:
-                return {
-                    "success": False,
-                    "file_path": "",
-                    "source": source,
-                    "message": f"PMC access blocked due to rate limiting. Please wait and try again later, or use DOI directly. Error: {error_msg}"
-                }
-            raise
-
-        # Check for errors or authentication issues
-        if result.status_code in [401, 403, 405]:
-            # Try with minimal headers (browser-like but simpler)
-            headers_basic = {
-                "User-Agent": user_agent,
-                "Accept": "*/*"
-            }
-            result = await download_with_retry(jina_url, headers_basic, max_retries=3)
-
-        # If still getting errors, try search mode
-        if result.status_code >= 400:
-            try:
-                content = result.text.lower()
-                if any(error in content for error in ["cookies disabled", "cookie", "access denied", "403 forbidden", "paywall"]):
-                    # Try search mode which might bypass restrictions
-                    jina_url_search = f"https://s.jina.ai/{actual_url}"
-                    headers_simple = {
-                        "User-Agent": user_agent
-                    }
-                    result = await download_with_retry(jina_url_search, headers_simple, max_retries=3)
-            except:
-                pass
-
-        result.raise_for_status()
-
-        # Determine output path
-        final_output_path = output_path
-        if final_output_path is None:
-            # Determine filename based on available identifiers
-            if doi:
-                sanitized_doi = doi.replace("/", "_").replace(":", "_")
-                final_output_path = f"./papers/{sanitized_doi}.txt"
-            elif pmid:
-                sanitized_pmid = pmid.replace("/", "_").replace(":", "_")
-                final_output_path = f"./papers/pmid_{sanitized_pmid}.txt"
-            else:
-                final_output_path = "./papers/unknown_paper.txt"
-
-        # Create directory if needed
-        dir_path = os.path.dirname(final_output_path)
-        if dir_path:  # Only create if there's a directory path
-            os.makedirs(dir_path, exist_ok=True)
-
-        # Save to file
-        with open(final_output_path, "w", encoding="utf-8") as f:
-            f.write(result.text)
-
-        return {
-            "success": True,
-            "file_path": final_output_path,
-            "source": source,
-            "message": f"Successfully downloaded paper from {source} to {final_output_path}"
-        }
-
-    except requests.exceptions.RequestException as e:
-        error_msg = str(e)
-
-        # Special handling for SecurityCompromiseError
-        if "SecurityCompromiseError" in error_msg or "blocked" in error_msg.lower():
-            return {
-                "success": False,
-                "file_path": "",
-                "source": source if 'source' in locals() else "Unknown",
-                "message": f"Access blocked by rate limiting. Please try again later or use prefer_pmc=False. Error: {error_msg}"
-            }
+        # ===== STEP 5: All methods failed =====
+        methods_tried = []
+        if prefer_pmc and pmid:
+            methods_tried.append("PMC efetch")
+            if pmcid:
+                methods_tried.append("PMC Jina")
+        if doi:
+            methods_tried.append("DOI")
+        if pmid:
+            methods_tried.append("Abstract")
 
         return {
             "success": False,
             "file_path": "",
-            "source": source if 'source' in locals() else "Unknown",
+            "source": "",
+            "message": f"All download methods failed. Tried: {', '.join(methods_tried) or 'none'}"
+        }
+
+    except requests.exceptions.RequestException as e:
+        error_msg = str(e)
+        if "SecurityCompromiseError" in error_msg or "blocked" in error_msg.lower():
+            return {
+                "success": False,
+                "file_path": "",
+                "source": "",
+                "message": f"Access blocked by rate limiting. Please try again later. Error: {error_msg}"
+            }
+        return {
+            "success": False,
+            "file_path": "",
+            "source": "",
             "message": f"Network error: {error_msg}"
         }
     except OSError as e:
         return {
             "success": False,
             "file_path": "",
-            "source": source if 'source' in locals() else "Unknown",
+            "source": "",
             "message": f"File system error: {str(e)}"
         }
     except Exception as e:
         return {
             "success": False,
             "file_path": "",
-            "source": source if 'source' in locals() else "Unknown",
+            "source": "",
             "message": f"Error downloading paper: {str(e)}"
         }
