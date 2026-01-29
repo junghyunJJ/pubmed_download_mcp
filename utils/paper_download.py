@@ -1,5 +1,5 @@
 """
-Paper download functionality using Jina Reader API
+Paper download functionality using Jina Reader API and NCBI efetch
 with improved rate limiting and error handling
 """
 
@@ -9,6 +9,198 @@ import random
 from typing import Dict, Any, Optional
 import requests
 from Bio import Entrez
+from bs4 import BeautifulSoup
+
+
+def parse_jats_xml_to_text(xml_content: bytes) -> str:
+    """
+    Parse JATS XML (PMC full text) to plain text for RAG.
+
+    Extracts title, abstract, and body sections from PMC's JATS XML format
+    and formats them as clean, readable text.
+
+    Args:
+        xml_content: Raw XML bytes from NCBI efetch
+
+    Returns:
+        Formatted plain text suitable for RAG and analysis
+    """
+    soup = BeautifulSoup(xml_content, "xml")
+
+    sections = []
+
+    # Extract article title
+    title_tag = soup.find("article-title")
+    if title_tag:
+        title_text = title_tag.get_text(strip=True)
+        sections.append(f"Title: {title_text}")
+
+    # Extract authors
+    authors = []
+    for contrib in soup.find_all("contrib", {"contrib-type": "author"}):
+        surname = contrib.find("surname")
+        given_names = contrib.find("given-names")
+        if surname:
+            name = surname.get_text(strip=True)
+            if given_names:
+                name = f"{given_names.get_text(strip=True)} {name}"
+            authors.append(name)
+    if authors:
+        sections.append(f"Authors: {', '.join(authors)}")
+
+    # Extract journal info
+    journal_title = soup.find("journal-title")
+    if journal_title:
+        sections.append(f"Journal: {journal_title.get_text(strip=True)}")
+
+    # Extract publication year
+    pub_date = soup.find("pub-date")
+    if pub_date:
+        year = pub_date.find("year")
+        if year:
+            sections.append(f"Year: {year.get_text(strip=True)}")
+
+    # Extract PMC ID
+    article_id = soup.find("article-id", {"pub-id-type": "pmc"})
+    if article_id:
+        sections.append(f"PMC ID: PMC{article_id.get_text(strip=True)}")
+
+    # Extract DOI
+    doi_tag = soup.find("article-id", {"pub-id-type": "doi"})
+    if doi_tag:
+        sections.append(f"DOI: {doi_tag.get_text(strip=True)}")
+
+    sections.append("")  # Empty line before abstract
+
+    # Extract abstract
+    abstract = soup.find("abstract")
+    if abstract:
+        sections.append("Abstract:")
+        # Handle structured abstracts with sections
+        abstract_sections = abstract.find_all("sec")
+        if abstract_sections:
+            for sec in abstract_sections:
+                sec_title = sec.find("title")
+                if sec_title:
+                    sections.append(f"\n{sec_title.get_text(strip=True)}:")
+                for p in sec.find_all("p"):
+                    sections.append(p.get_text(strip=True))
+        else:
+            # Simple abstract
+            for p in abstract.find_all("p"):
+                sections.append(p.get_text(strip=True))
+        sections.append("")
+
+    # Extract body content
+    body = soup.find("body")
+    if body:
+        sections.append("Full Text:")
+        sections.append("")
+
+        # Process each section
+        for sec in body.find_all("sec", recursive=False):
+            _process_section(sec, sections, level=1)
+
+        # If no sections, just get paragraphs
+        if not body.find_all("sec", recursive=False):
+            for p in body.find_all("p", recursive=False):
+                sections.append(p.get_text(strip=True))
+                sections.append("")
+
+    # References section excluded for RAG efficiency
+    # (reference text adds noise without adding semantic value)
+
+    return "\n".join(sections)
+
+
+def _process_section(sec, sections: list, level: int = 1):
+    """Helper function to recursively process JATS sections."""
+    # Get section title
+    title = sec.find("title", recursive=False)
+    if title:
+        prefix = "#" * min(level + 1, 4)  # Markdown-style headers
+        sections.append(f"{prefix} {title.get_text(strip=True)}")
+        sections.append("")
+
+    # Process paragraphs in this section
+    for p in sec.find_all("p", recursive=False):
+        text = p.get_text(strip=True)
+        if text:
+            sections.append(text)
+            sections.append("")
+
+    # Process nested sections
+    for nested_sec in sec.find_all("sec", recursive=False):
+        _process_section(nested_sec, sections, level + 1)
+
+
+async def fetch_pmc_fulltext(
+    pmcid: str,
+    email: str,
+    api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Fetch full text from PMC using NCBI efetch API.
+
+    This function provides a direct download from NCBI's PMC database,
+    bypassing Jina Reader which may be blocked by PMC's DDoS protection.
+
+    Args:
+        pmcid: PMC ID (e.g., "PMC1234567" or "1234567")
+        email: Email for NCBI Entrez API (required by NCBI policy)
+        api_key: Optional NCBI API key for higher rate limits
+
+    Returns:
+        Dictionary with:
+        - success: bool indicating if fetch was successful
+        - content: str containing formatted full text
+        - message: str with status message
+    """
+    Entrez.email = email
+    if api_key:
+        Entrez.api_key = api_key
+
+    # Normalize PMC ID (remove "PMC" prefix if present)
+    pmc_number = pmcid.replace("PMC", "").strip()
+
+    try:
+        def _fetch():
+            handle = Entrez.efetch(
+                db="pmc",
+                id=pmc_number,
+                rettype="full",
+                retmode="xml"
+            )
+            xml_content = handle.read()
+            handle.close()
+            return xml_content
+
+        # Rate limiting for NCBI compliance
+        await asyncio.sleep(0.5)
+        xml_content = await asyncio.to_thread(_fetch)
+
+        # Parse XML to text
+        text_content = parse_jats_xml_to_text(xml_content)
+
+        if not text_content or len(text_content.strip()) < 100:
+            return {
+                "success": False,
+                "content": "",
+                "message": f"PMC efetch returned empty or minimal content for {pmcid}"
+            }
+
+        return {
+            "success": True,
+            "content": text_content,
+            "message": f"Successfully fetched full text from PMC via efetch for {pmcid}"
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "content": "",
+            "message": f"Error fetching PMC full text via efetch: {str(e)}"
+        }
 
 
 async def check_pmc_availability(pmid: str, email: str, api_key: Optional[str] = None) -> Optional[str]:
@@ -283,7 +475,7 @@ async def download_paper_from_doi(
     force_download: bool = False
 ) -> Dict[str, Any]:
     """
-    Download paper from DOI or PMC using Jina Reader API.
+    Download paper from DOI or PMC using NCBI efetch and Jina Reader API.
 
     At least one of DOI or PMID must be provided.
 
@@ -291,9 +483,10 @@ async def download_paper_from_doi(
     to prevent DDoS detection and blocking.
 
     Download strategy:
-    1. If prefer_pmc=True and PMC available: Use Jina Reader with PMC URL
-    2. Fallback to DOI download via Jina Reader API
-    3. Final fallback to search mode for paywalled content
+    1. Check cache first
+    2. If PMC available: Try NCBI efetch (official API, no blocking)
+    3. Fallback to DOI via Jina Reader API
+    4. Final fallback to PubMed abstract
 
     Args:
         doi: Paper DOI (optional if pmid provided)
@@ -353,6 +546,7 @@ async def download_paper_from_doi(
 
         actual_url = None
         source = "DOI"
+        pmcid = None
 
         # Try PMC first if requested
         if prefer_pmc and pmid and entrez_email:
@@ -363,9 +557,45 @@ async def download_paper_from_doi(
 
             pmcid = await check_pmc_availability(pmid, entrez_email, ncbi_api_key)
             if pmcid:
-                print(f"Found PMC version: {pmcid}, using Jina Reader...")
-                actual_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
-                source = "PMC"
+                print(f"Found PMC version: {pmcid}, trying NCBI efetch...")
+
+                # Try NCBI efetch first (official API, no DDoS blocking)
+                efetch_result = await fetch_pmc_fulltext(pmcid, entrez_email, ncbi_api_key)
+
+                if efetch_result["success"]:
+                    # Determine output path
+                    final_output_path = output_path
+                    if final_output_path is None:
+                        if doi:
+                            sanitized_doi = doi.replace("/", "_").replace(":", "_")
+                            final_output_path = f"./papers/{sanitized_doi}.txt"
+                        elif pmid:
+                            sanitized_pmid = pmid.replace("/", "_").replace(":", "_")
+                            final_output_path = f"./papers/pmid_{sanitized_pmid}.txt"
+                        else:
+                            sanitized_pmcid = pmcid.replace("/", "_").replace(":", "_")
+                            final_output_path = f"./papers/{sanitized_pmcid}.txt"
+
+                    # Create directory if needed
+                    dir_path = os.path.dirname(final_output_path)
+                    if dir_path:
+                        os.makedirs(dir_path, exist_ok=True)
+
+                    # Save to file
+                    with open(final_output_path, "w", encoding="utf-8") as f:
+                        f.write(efetch_result["content"])
+
+                    return {
+                        "success": True,
+                        "file_path": final_output_path,
+                        "source": "PMC_efetch",
+                        "message": f"Successfully downloaded paper from PMC via NCBI efetch to {final_output_path}"
+                    }
+                else:
+                    # efetch failed, fall back to Jina Reader
+                    print(f"NCBI efetch failed: {efetch_result['message']}, falling back to Jina Reader...")
+                    actual_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+                    source = "PMC"
 
         # Use DOI by default or as fallback
         if not actual_url and doi:
