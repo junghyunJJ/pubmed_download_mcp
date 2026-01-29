@@ -5,26 +5,29 @@ A Model Context Protocol (MCP) server for searching PubMed and downloading scien
 ## Features
 
 - **PubMed Search**: Search papers by ligand-receptor pairs or general queries
-- **Paper Download**: Download full-text papers from PMC or via DOI
+- **Paper Download**: Download full-text papers from PMC (via NCBI efetch) or DOI
+- **NCBI efetch**: Official NCBI API for PMC downloads (no DDoS blocking)
+- **JATS XML Parsing**: Clean plain text extraction from PMC's XML format
 - **Abstract Fallback**: Automatically fetch abstracts for papers without full text
 - **Smart Caching**: Avoid redundant downloads with automatic caching
 - **Async Operations**: Non-blocking operations for better performance
 - **NCBI Compliant**: Rate limiting and proper headers to prevent blocking
 
-## Version 3.0 Updates
+## Version 4.0 Updates
 
 ### New Features
-- **PubMed Abstract Fallback**: Papers without PMC or DOI now return abstracts with metadata
-- **Enhanced Caching**: Checks for both full-text and abstract cache files
-- **Simplified Interface**: Removed `force_download` option from MCP tool
-- **Improved Error Handling**: Better error messages and graceful degradation
+- **NCBI efetch for PMC**: Direct download via official NCBI API (no DDoS blocking)
+- **JATS XML Parsing**: Full-text extraction from PMC's XML format
+- **References Excluded**: Cleaner output for RAG (removes reference noise)
+- **PubMed Abstract Fallback**: Papers without PMC or DOI return abstracts with metadata
 
-### Download Strategy (v3.0)
+### Download Strategy (v4.0)
 ```
 1. Check Cache (full text or abstract)
-2. If prefer_pmc=True: Try PMC → Use Jina Reader
-3. Try DOI → Use Jina Reader
-4. Fallback: Fetch abstract from PubMed ✨ NEW
+2. If PMC available: Try NCBI efetch ✨ NEW (official API, no blocking)
+3. Fallback: DOI via Jina Reader
+4. Fallback: PMC via Jina Reader (legacy)
+5. Final Fallback: Fetch abstract from PubMed
 ```
 
 ## Installation
@@ -142,14 +145,15 @@ download_paper(
 
 **Returns**: Dictionary with success status, file path, source, and message
 
-### Download Behavior (v3.0)
+### Download Behavior (v4.0)
 
 | Scenario | Source | Result |
 |----------|--------|--------|
-| PMC available | PMC (via Jina Reader) | Full-text paper |
-| DOI available | DOI (via Jina Reader) | Full-text paper |
-| Neither available | PubMed Abstract | Abstract + metadata |
-| Already cached | Cache | Cached file (no download) |
+| PMC available | `PMC_efetch` (NCBI API) | Full-text paper (JATS XML → plain text) |
+| PMC efetch fails | `PMC` (via Jina Reader) | Full-text paper (legacy fallback) |
+| DOI available | `DOI` (via Jina Reader) | Full-text paper |
+| Neither available | `PubMed_Abstract` | Abstract + metadata |
+| Already cached | `Cache` | Cached file (no download) |
 
 ### Output Files
 
@@ -210,10 +214,16 @@ papers = await search_pubmed_lr(
 
 ## File Formats
 
-### Full-Text Papers
+### Full-Text Papers (PMC efetch)
+- Clean plain text parsed from JATS XML
+- Includes: title, authors, journal, year, DOI, PMC ID
+- Includes: abstract (handles structured abstracts)
+- Includes: full body text with section headers
+- References excluded (for RAG efficiency)
+
+### Full-Text Papers (Jina Reader)
 - Clean markdown format from Jina Reader
 - Includes title, authors, abstract, full body text
-- References included (when available)
 
 ### Abstract-Only Files
 ```
@@ -237,6 +247,7 @@ Note: Full text not available. This file contains only the abstract and metadata
 The server implements NCBI-compliant rate limiting:
 
 - **PubMed Search**: 0.5s delay between requests (2 req/s)
+- **PMC efetch**: 0.5s delay (official API, no DDoS issues)
 - **PMC Checks**: 2-4s random delay (to prevent DDoS detection)
 - **DOI Requests**: 1-2s delay
 - **With NCBI API Key**: Up to 10 req/s (vs 3 req/s without)
@@ -259,6 +270,10 @@ The server implements NCBI-compliant rate limiting:
 **Issue**: Rate limiting errors
 - **Cause**: Too many requests to NCBI/PMC
 - **Solution**: Server automatically implements delays; wait and retry
+
+**Issue**: Jina Reader blocked by PMC (DDoS detection)
+- **Solution**: v4.0 uses NCBI efetch as primary method (no blocking)
+- **Note**: efetch only works for PMC Open Access papers
 
 ### Debug Mode
 
@@ -338,7 +353,14 @@ MIT License - See LICENSE file for details
 
 ## Changelog
 
-### v3.0 (Current)
+### v4.0 (Current)
+- ✨ Added NCBI efetch for PMC downloads (official API, no DDoS blocking)
+- ✨ Added JATS XML to plain text parser (`parse_jats_xml_to_text`)
+- ✨ References excluded from output for RAG efficiency
+- ✨ New source type: `PMC_efetch`
+- 🔧 Added `lxml` dependency for XML parsing
+
+### v3.0
 - ✨ Added PubMed abstract fallback for papers without PMC/DOI
 - ✨ Enhanced cache checking (full text + abstract)
 - ✨ Removed `force_download` option from MCP tool
